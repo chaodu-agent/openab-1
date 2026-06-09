@@ -99,6 +99,190 @@ When Reviewer posts `CHANGES REQUESTED`, it sends a structured Discord message m
 
 Human override has the highest priority at all times.
 
+## Loop Controller Design
+
+The Loop Controller is the central coordinator. It does no actual work (no reviewing, no coding) — it only monitors state, enforces timeouts, and dispatches agents.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    LOOP CONTROLLER                         │
+│                                                          │
+│  Input:  GitHub webhooks, Discord messages                │
+│  Output: Dispatch commands, Escalation alerts            │
+│  State:  Persisted in state store (file / Redis / DB)    │
+│                                                          │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │
+│  │ Event      │  │ State      │  │ Timer / Watchdog   │ │
+│  │ Listener   │→ │ Machine    │→ │                    │ │
+│  └────────────┘  └────────────┘  └────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+         │                                    │
+         ▼                                    ▼
+┌─────────────────┐                 ┌──────────────────┐
+│ Agents          │                 │ Human (escalation)│
+│ (Reviewer/Coder)│                 │                  │
+└─────────────────┘                 └──────────────────┘
+```
+
+### State Machine (one instance per PR)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Loop State for PR #N                               │
+│                                                     │
+│  state: REVIEWING | FIXING | APPROVED | ESCALATED   │
+│  iteration: <current>                               │
+│  max_iterations: 3                                  │
+│  started_at: <timestamp>                            │
+│  current_step_started: <timestamp>                  │
+│  timeout_per_step: 10m (review) / 15m (fix)         │
+│  token_used: <accumulated>                          │
+│  token_budget: 50000                                │
+│  retries: 0 | 1                                     │
+│  history: [{step, result, timestamp}, ...]          │
+└─────────────────────────────────────────────────────┘
+```
+
+### Event Routing
+
+| Event Source | Event | Controller Action |
+|-------------|-------|-------------------|
+| GitHub webhook | `pull_request.opened` | Create loop state, dispatch reviewer |
+| GitHub webhook | `pull_request.synchronize` | Update state, dispatch reviewer (re-review) |
+| Discord message | Reviewer posted verdict | Parse verdict, update state, decide next step |
+| Discord message | Coder says pushed | Update state, await webhook confirmation |
+| Discord message | Human says "stop" | Terminate loop |
+| Internal timer | Step timeout reached | Retry or escalate |
+
+### Decision Logic
+
+```python
+def on_event(event, loop_state):
+    match loop_state.state:
+
+        case "IDLE":
+            if event == PR_OPENED:
+                loop_state.state = "REVIEWING"
+                dispatch_reviewer(loop_state.pr)
+                start_timer(timeout=10min)
+
+        case "REVIEWING":
+            if event == VERDICT_RECEIVED:
+                cancel_timer()
+                if event.verdict == "LGTM":
+                    loop_state.state = "APPROVED"
+                    notify_human("PR ready to merge")
+                elif event.verdict == "CHANGES_REQUESTED":
+                    if loop_state.iteration >= max_iterations:
+                        escalate("Max iterations reached")
+                    elif has_security_findings(event.findings):
+                        escalate("Security findings need human")
+                    else:
+                        loop_state.state = "FIXING"
+                        dispatch_coder(findings)
+                        start_timer(timeout=15min)
+                elif event.verdict == "INCOMPLETE":
+                    retry_or_escalate(loop_state)
+
+            if event == TIMEOUT:
+                retry_or_escalate(loop_state)
+
+        case "FIXING":
+            if event == PUSH_RECEIVED:
+                cancel_timer()
+                loop_state.iteration += 1
+                loop_state.state = "REVIEWING"
+                start_timer(timeout=10min)
+                # No dispatch needed — webhook synchronize triggers reviewer
+
+            if event == FIX_FAILED:
+                escalate("Coder failed to fix")
+
+            if event == TIMEOUT:
+                retry_or_escalate(loop_state)
+
+        case "APPROVED":
+            if event == HUMAN_SAYS_MERGE:
+                merge_pr()
+                loop_state.state = "DONE"
+
+        case "ESCALATED":
+            # Loop paused — only human commands accepted
+            if event == HUMAN_OVERRIDE:
+                handle_override(event)
+```
+
+### Retry and Timeout Policy
+
+```
+Per-step timeout:
+  - Review: 10 min
+  - Fix: 15 min
+  - Entire loop: 60 min (hard cap)
+
+Retry policy:
+  - Max 1 retry per step
+  - If step fails after retry → escalate to human
+  - Retry resets the step timer
+
+Implementation options (simple → complex):
+  1. Cron job polling state store every 2 min
+  2. Delayed message queue (SQS / BullMQ)
+  3. In-process scheduler (tokio timer / setTimeout)
+```
+
+### Completion Check
+
+Reviewer output must contain one of:
+- `LGTM ✅`
+- `CHANGES REQUESTED ⚠️`
+- `INCOMPLETE ⏸️ — reason: <reason>`
+
+If none appears within the timeout window, the controller treats it as an incomplete step and applies the retry policy.
+
+### State Store
+
+Phase 1: file-based state under `~/.openab/loops/state/pr-{number}.json`
+
+```json
+{
+  "pr": 42,
+  "repo": "openab-io/openab",
+  "state": "REVIEWING",
+  "iteration": 2,
+  "max_iterations": 3,
+  "started_at": "2026-06-09T03:30:00Z",
+  "current_step_started": "2026-06-09T03:35:00Z",
+  "token_used": 18000,
+  "token_budget": 50000,
+  "retries": 0,
+  "history": [
+    {"step": "review", "result": "CHANGES_REQUESTED", "ts": "..."},
+    {"step": "fix", "result": "pushed", "commit": "abc123", "ts": "..."}
+  ]
+}
+```
+
+Later phases can migrate to Redis or DynamoDB.
+
+### Deployment Options
+
+| Option | Description | Tradeoff |
+|--------|-------------|----------|
+| Standalone process | Persistent server (Express/Axum) listening to webhooks + Discord | Most reliable, needs hosting |
+| Embedded in webhook handler | Add state machine as middleware in existing handler | No new infra, couples concerns |
+| Serverless | Lambda + EventBridge for timers | Scales to zero, cold start latency |
+
+### Decoupling Principle
+
+The controller communicates with agents **only through Discord mentions**. Agents do not know the controller exists — they only respond to mentions. This keeps agents stateless and the controller replaceable.
+
+```
+Controller → Discord mention → Agent works → Discord/GitHub event → Controller
+```
+
 ## Open vs Closed Looping
 
 | | Open Loop | Closed Loop |
